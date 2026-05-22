@@ -1,15 +1,13 @@
 """
-Dentsu Smart Buddy — v5.1 (Production)
+Dentsu Edulearn Bot — v5.1 (Production)
 =========================================
 Features:
-  1. Smart keyword-based routing (no LLM hallucination) — works per doc type
-  2. Professional onboarding page — "Dentsu Smart Buddy"
-  3. URL/blog link → WebLoader → Q&A
-  4. CSV/Excel → pandas analysis + chart generation
-  5. Multi-document interaction (image + doc + csv simultaneously)
-  6. Compatible with langchain==1.2.17, langchain-core==1.3.3,
-     langchain-classic==1.0.5, langchain-community==0.4.1,
-     langchain-openai==1.1.10 on Python 3.11
+    1. Learner profile capture (name + role) with guided onboarding
+    2. Document-first routing and answer validation before web search
+    3. URL/blog link ingestion + Q&A
+    4. CSV/Excel analysis + chart generation
+    5. Multi-document interaction (image + doc + csv simultaneously)
+    6. Humanized tutoring responses with sample-learning fallback
 """
 
 import streamlit as st
@@ -28,11 +26,34 @@ from warnings import filterwarnings
 filterwarnings("ignore")
 
 st.set_page_config(
-    page_title="Dentsu Smart Buddy",
+    page_title="Dentsu Edulearn Bot",
     page_icon="🔵",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+SAMPLE_LEARNING_DATA = {
+    "prompt engineering": (
+        "Prompt engineering improves AI output quality by giving clear role, context, constraints, "
+        "and expected format. A simple structure is: Goal -> Context -> Constraints -> Output format -> Example."
+    ),
+    "data analysis": (
+        "A fast learning loop for data analysis is: inspect schema, clean nulls, compute descriptive stats, "
+        "visualize one question at a time, then summarize insights with numbers."
+    ),
+    "rag": (
+        "Retrieval Augmented Generation (RAG) first retrieves relevant chunks from trusted documents and then "
+        "generates an answer grounded in that evidence, reducing hallucination risk."
+    ),
+    "python": (
+        "For learning Python quickly, start with variables, loops, functions, and data structures, then build "
+        "small projects and explain your code in plain language after each task."
+    ),
+    "machine learning": (
+        "A practical ML workflow is: define metric, split data, baseline model, feature engineering, model tuning, "
+        "and error analysis with clear next actions."
+    ),
+}
 
 # ─────────────────────────────────────────────
 # CSS
@@ -288,16 +309,25 @@ def init_database():
 
 def _hash(pw): return hashlib.sha256(f"dentsu_salt_2025_{pw}".encode()).hexdigest()
 
-def register_user(username, password):
-    uid = str(uuid.uuid4()); display = username.strip().title()
+def register_user(username, password, display_name=None, role="learner"):
+    uid = str(uuid.uuid4()); display = (display_name or username).strip().title()
+    safe_role = (role or "learner").strip().lower()
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.execute("INSERT INTO users VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)",
-                     (uid, username.lower().strip(), _hash(password), display, "user"))
+                     (uid, username.lower().strip(), _hash(password), display, safe_role))
         conn.commit(); conn.close()
-        return {"user_id": uid, "username": username.lower().strip(), "display_name": display, "role": "user"}
+        return {"user_id": uid, "username": username.lower().strip(), "display_name": display, "role": safe_role}
     except sqlite3.IntegrityError:
         conn.close(); return None
+
+def update_user_profile(user_id, display_name, role):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE users SET display_name=?, role=? WHERE user_id=?",
+        ((display_name or "Learner").strip(), (role or "learner").strip().lower(), user_id),
+    )
+    conn.commit(); conn.close()
 
 def authenticate(username, password):
     conn = sqlite3.connect(DB_PATH)
@@ -583,6 +613,61 @@ def is_query_about_docs(query):
 
     return False
 
+def get_sample_learning_answer(query):
+    q = (query or "").lower()
+    best_topic = None
+    best_score = 0
+    for topic, content in SAMPLE_LEARNING_DATA.items():
+        tokens = set(re.findall(r"[a-z]{3,}", f"{topic} {content}".lower()))
+        score = len(tokens & set(re.findall(r"[a-z]{3,}", q)))
+        if topic in q:
+            score += 3
+        if score > best_score:
+            best_score = score
+            best_topic = topic
+    if not best_topic:
+        best_topic = "rag"
+    return (
+        f"I don't have enough matching evidence in your uploaded content yet, so here's a starter learning note "
+        f"from sample data on **{best_topic.title()}**:\n\n"
+        f"{SAMPLE_LEARNING_DATA[best_topic]}\n\n"
+        "If you upload role-specific notes/slides, I can tailor this to your exact work context."
+    )
+
+def humanize_answer(answer, user):
+    first_name = (user.get("display_name") or "Learner").split()[0]
+    role = (user.get("role") or "learner").title()
+    return (
+        f"Hi {first_name} ({role}) - here is what I found:\n\n"
+        f"{answer}\n\n"
+        "If helpful, I can also convert this into a short action checklist for your learning plan."
+    )
+
+def validate_doc_grounding(prompt, answer, text_entries, df_entries):
+    """Lightweight grounding check to keep doc-first behavior deterministic."""
+    if not answer:
+        return False, "No answer was generated from document context."
+    answer_l = answer.lower()
+    weak_patterns = [
+        "not in the documents",
+        "couldn't find",
+        "cannot find",
+        "don't have enough",
+        "not available in the provided",
+    ]
+    if any(p in answer_l for p in weak_patterns):
+        return False, "The response explicitly says supporting details were missing in documents."
+
+    doc_text_blob = " ".join((text_entries or {}).values())[:20000].lower()
+    if df_entries:
+        doc_text_blob += " data table csv excel columns rows"
+
+    q_words = set(re.findall(r"\b[a-zA-Z]{4,}\b", prompt.lower()))
+    a_words = set(re.findall(r"\b[a-zA-Z]{4,}\b", answer_l))
+    key_terms = (q_words | a_words)
+    matches = len([w for w in key_terms if w in doc_text_blob])
+    return (matches >= 4), ("Grounded" if matches >= 4 else "Low overlap with document terms")
+
 
 # ═══════════════════════════════════════════════
 # EXECUTION PATHS
@@ -648,13 +733,13 @@ def run_combined_query(prompt, image_entries, text_entries, df_entries, user, ci
     # Use vision-capable model if images present
     try:
         llm = get_llm(max_tokens=2000)
-        sys_content = f"You are Dentsu Smart Buddy. Today is {today_str}. "
+        sys_content = f"You are Dentsu Edulearn Bot. Today is {today_str}. "
         if has_images:
             sys_content += ("Analyze any provided images in detail alongside document text. "
                            "Describe what you see, extract text/data if present. ")
         sys_content += ("Answer using the provided document/image context. "
                        "If the answer isn't in the provided materials, say so clearly. "
-                       "Format with markdown. Be thorough but concise.")
+                       "Respond like a human tutor: practical, warm, and concise. Format with markdown.")
 
         messages = [SystemMessage(content=sys_content), HumanMessage(content=content_parts)]
         response = llm.invoke(messages)
@@ -790,9 +875,10 @@ def run_doc_qa(prompt, text_entries, user, cid):
         llm = get_llm()
         today_str = datetime.now().strftime("%B %d, %Y")
         resp = llm.invoke([
-            SystemMessage(content=f"You are Dentsu Smart Buddy. Today is {today_str}. "
+            SystemMessage(content=f"You are Dentsu Edulearn Bot. Today is {today_str}. "
                           "Answer using ONLY the provided document context. "
-                          "If the answer isn't in the documents, say so. Format with markdown."),
+                          "If the answer isn't in the documents, say so and ask one clarifying question. "
+                          "Use a warm, human teaching tone. Format with markdown."),
             HumanMessage(content=augmented)
         ])
         answer = resp.content if resp.content else "I couldn't find an answer in your documents."
@@ -925,11 +1011,12 @@ def init_agent():
     from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
     today_str = datetime.now().strftime("%B %d, %Y")
     prompt = ChatPromptTemplate.from_messages([
-        ("system", f"""You are Dentsu Smart Buddy — an AI research assistant.
+        ("system", f"""You are Dentsu Edulearn Bot — an AI learning assistant.
 Today's date is {today_str}.
 Tools: search_web_extract_info (web search), get_weather (weather).
+    Before broad web search, prefer clarifying user intent and document-grounded learning.
 ALWAYS use search_web_extract_info for current events, news, sports, elections, rankings.
-Format answers with markdown. Include source URLs. Be thorough but concise."""),
+    Format answers with markdown. Include source URLs. Be thorough but concise and human."""),
         MessagesPlaceholder(variable_name="history", optional=True),
         ("human", "{query}"),
         MessagesPlaceholder(variable_name="agent_scratchpad"),
@@ -960,13 +1047,14 @@ def render_login():
         st.markdown("""
         <div class="login-brand">
             <div class="lb-icon">🤖</div>
-            <h1>Dentsu <span>Smart Buddy</span></h1>
-            <div class="lb-tag">Intelligent Research Assistant</div>
+            <h1>Dentsu <span>Edulearn Bot</span></h1>
+            <div class="lb-tag">Intelligent Learning Assistant</div>
             <div class="lb-desc">
-                Your AI-powered research companion — analyze documents, explore data,
-                search the web, and get insights in seconds.
+                Your AI-powered learning companion - analyze documents, explore data,
+                validate answers from your notes, and grow skills faster.
             </div>
             <div class="login-features">
+                <div class="login-feat"><span class="lf-dot"></span> Learner Profile</div>
                 <div class="login-feat"><span class="lf-dot"></span> Document Q&A</div>
                 <div class="login-feat"><span class="lf-dot"></span> Data Analysis</div>
                 <div class="login-feat"><span class="lf-dot"></span> Web Research</div>
@@ -991,16 +1079,19 @@ def render_login():
         with t2:
             with st.form("signup_form", clear_on_submit=True):
                 nu = st.text_input("Choose a username", placeholder="e.g. john.doe", key="su")
+                dn = st.text_input("Full name", placeholder="e.g. John Doe", key="sdn")
+                rl = st.selectbox("Role", options=["Learner", "Manager", "Analyst", "Trainer", "Intern"], key="srole")
                 p1 = st.text_input("Create password", type="password", placeholder="Min 4 characters", key="sp1")
                 p2 = st.text_input("Confirm password", type="password", placeholder="Re-enter password", key="sp2")
                 if st.form_submit_button("Create Account", use_container_width=True):
                     nc = (nu or "").strip()
                     if not nc or not p1: st.warning("Both fields required.")
+                    elif not (dn or "").strip(): st.warning("Please provide your full name.")
                     elif len(nc) < 3: st.warning("Username must be 3+ characters.")
                     elif len(p1) < 4: st.warning("Password must be 4+ characters.")
                     elif p1 != p2: st.error("Passwords don't match.")
                     else:
-                        r = register_user(nc, p1)
+                        r = register_user(nc, p1, display_name=dn, role=rl)
                         if r: st.success(f"Account created! Sign in as **{nc}**.")
                         else: st.error("Username already taken.")
         st.markdown("<p style='text-align:center;color:var(--text-400);font-size:0.68rem;margin-top:1.5rem;'>Powered by Dentsu AI · Secure & Confidential</p>", unsafe_allow_html=True)
@@ -1013,9 +1104,24 @@ def render_login():
 def render_sidebar():
     user = st.session_state["user"]
     with st.sidebar:
-        st.markdown('<div class="brand-box"><div class="logo">🤖 Dentsu Smart Buddy</div><div class="sub">AI Research Assistant</div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="brand-box"><div class="logo">🤖 Dentsu Edulearn Bot</div><div class="sub">AI Learning Assistant</div></div>', unsafe_allow_html=True)
         ini = user["display_name"][0].upper()
         st.markdown(f'<div class="user-pill"><div class="av">{ini}</div><div><div class="nm">{user["display_name"]}</div><div class="rl">{user["role"].title()}</div></div></div>', unsafe_allow_html=True)
+
+        with st.expander("👤 Learner Profile", expanded=False):
+            updated_name = st.text_input("Display name", value=user.get("display_name", ""), key="profile_name")
+            updated_role = st.selectbox(
+                "Role",
+                options=["learner", "manager", "analyst", "trainer", "intern"],
+                index=["learner", "manager", "analyst", "trainer", "intern"].index(user.get("role", "learner").lower()) if user.get("role", "learner").lower() in ["learner", "manager", "analyst", "trainer", "intern"] else 0,
+                key="profile_role",
+            )
+            if st.button("Update Profile", use_container_width=True, key="update_profile"):
+                update_user_profile(user["user_id"], updated_name, updated_role)
+                st.session_state["user"]["display_name"] = updated_name.strip() or user.get("display_name", "Learner")
+                st.session_state["user"]["role"] = updated_role
+                st.success("Profile updated.")
+                st.rerun()
 
         st.markdown('<hr class="sd">', unsafe_allow_html=True)
         with st.expander("🔑 API Configuration", expanded=not st.session_state.get("azure_endpoint")):
@@ -1033,7 +1139,9 @@ def render_sidebar():
 
         if st.button("＋  New conversation", use_container_width=True, key="new_chat"):
             st.session_state["current_conv"] = None; st.session_state["messages"] = []
-            st.session_state.pop("pending_web_search", None); st.rerun()
+            st.session_state.pop("pending_web_search", None)
+            st.session_state.pop("pending_doc_scope", None)
+            st.rerun()
 
         st.markdown('<hr class="sd">', unsafe_allow_html=True)
         st.markdown("<p style='font-size:0.72rem;font-weight:700;color:var(--text-400);letter-spacing:0.1em;text-transform:uppercase;'>History</p>", unsafe_allow_html=True)
@@ -1060,7 +1168,7 @@ def render_sidebar():
         if "processed_files" not in st.session_state: st.session_state["processed_files"] = []
         if "doc_texts" not in st.session_state: st.session_state["doc_texts"] = {}
 
-        uploaded = st.file_uploader("Upload PDF, DOCX, TXT, CSV, Excel, Images",
+        uploaded = st.file_uploader("Upload learning files (PDF, DOCX, TXT, CSV, Excel, Images)",
                                     type=["pdf","docx","txt","png","jpg","jpeg","gif","webp","csv","xlsx","xls"],
                                     accept_multiple_files=True, key="uploader")
         if uploaded:
@@ -1113,7 +1221,7 @@ def render_sidebar():
         if st.button("Sign out", use_container_width=True, key="logout"):
             for k in list(st.session_state.keys()): del st.session_state[k]
             st.rerun()
-        st.markdown("<p style='color:var(--text-400);font-size:0.62rem;text-align:center;padding-top:0.8rem;'>Dentsu Smart Buddy v5.1</p>", unsafe_allow_html=True)
+        st.markdown("<p style='color:var(--text-400);font-size:0.62rem;text-align:center;padding-top:0.8rem;'>Dentsu Edulearn Bot v5.1</p>", unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════
@@ -1136,9 +1244,9 @@ def render_chat():
         st.markdown("""
         <div class="welcome-area">
             <div class="w-icon">🤖</div>
-            <h2>Hi! I'm Dentsu Smart Buddy</h2>
+            <h2>Hi! I'm Dentsu Edulearn Bot</h2>
             <p>Upload documents, paste URLs, or just ask me anything.
-            I handle PDFs, images, CSVs, Excel files, and web research — all at once.</p>
+            I prioritize your uploaded learning material first, then expand to web only when you ask.</p>
         </div>""", unsafe_allow_html=True)
 
     for msg in messages:
@@ -1174,6 +1282,102 @@ def render_chat():
         with st.chat_message("user", avatar="🟢"):
             st.markdown(prompt)
 
+        # ── Handle pending routing choice (docs/web/both) ──
+        pending_scope = st.session_state.pop("pending_doc_scope", None)
+        if pending_scope:
+            scope_reply = prompt.strip().lower()
+            docs_only_words = {"docs", "document", "documents", "uploaded", "notes", "1", "docs only"}
+            both_words = {"both", "2", "both please", "all", "use both"}
+            web_words = {"web", "internet", "search", "3", "web only"}
+
+            if scope_reply in docs_only_words or scope_reply.startswith("doc"):
+                image_entries, text_entries, df_entries = classify_doc_types()
+                with st.chat_message("assistant", avatar="🤖"):
+                    with st.spinner("Learning from your uploaded material..."):
+                        answer, sources, tool_info, chart_fig = run_combined_query(
+                            pending_scope, image_entries, text_entries, df_entries, user, cid
+                        )
+
+                        grounded, reason = validate_doc_grounding(pending_scope, answer, text_entries, df_entries)
+                        if not grounded:
+                            answer = f"{answer}\n\n---\n\n{get_sample_learning_answer(pending_scope)}"
+                            tool_info = f"{tool_info or 'Document Q&A'}, Sample Learning Fallback"
+
+                    answer = humanize_answer(answer, user)
+                    st.markdown(clean_answer_urls(answer, sources) if sources else answer)
+
+                    chart_key = None
+                    if chart_fig is not None:
+                        chart_key = f"chart_{uuid.uuid4().hex[:8]}"
+                        st.session_state.setdefault("charts", {})[chart_key] = chart_fig
+                        st.pyplot(chart_fig)
+                    render_sources_and_tools(sources, tool_info)
+
+                save_message(cid, "assistant", answer, sources=sources, tool_calls=tool_info)
+                st.session_state["messages"].append(
+                    {"role": "assistant", "content": answer, "sources": sources,
+                     "tool_calls": tool_info, "chart_key": chart_key}
+                )
+                return
+
+            if scope_reply in both_words or "both" in scope_reply:
+                image_entries, text_entries, df_entries = classify_doc_types()
+                with st.chat_message("assistant", avatar="🤖"):
+                    with st.spinner("Checking your documents first, then expanding if needed..."):
+                        answer, sources, tool_info, chart_fig = run_combined_query(
+                            pending_scope, image_entries, text_entries, df_entries, user, cid
+                        )
+                        grounded, _ = validate_doc_grounding(pending_scope, answer, text_entries, df_entries)
+                        if not grounded:
+                            web_answer, web_sources, web_tool = run_web_agent(pending_scope, user, cid)
+                            answer = (
+                                f"**From your documents:**\n{answer}\n\n---\n\n"
+                                f"**From web research:**\n{web_answer}"
+                            )
+                            sources = (sources or []) + (web_sources or [])
+                            tool_info = ", ".join([v for v in [tool_info, web_tool] if v])
+
+                    answer = humanize_answer(answer, user)
+                    st.markdown(clean_answer_urls(answer, sources) if sources else answer)
+                    chart_key = None
+                    if chart_fig is not None:
+                        chart_key = f"chart_{uuid.uuid4().hex[:8]}"
+                        st.session_state.setdefault("charts", {})[chart_key] = chart_fig
+                        st.pyplot(chart_fig)
+                    render_sources_and_tools(sources, tool_info)
+
+                save_message(cid, "assistant", answer, sources=sources, tool_calls=tool_info)
+                st.session_state["messages"].append(
+                    {"role": "assistant", "content": answer, "sources": sources,
+                     "tool_calls": tool_info, "chart_key": chart_key}
+                )
+                return
+
+            if scope_reply in web_words or scope_reply.startswith("web"):
+                with st.chat_message("assistant", avatar="🤖"):
+                    with st.spinner("Searching the web..."):
+                        answer, sources, tool_info = run_web_agent(pending_scope, user, cid)
+                    answer = humanize_answer(answer, user)
+                    st.markdown(clean_answer_urls(answer, sources) if sources else answer)
+                    render_sources_and_tools(sources, tool_info)
+                save_message(cid, "assistant", answer, sources=sources, tool_calls=tool_info)
+                st.session_state["messages"].append({"role": "assistant", "content": answer, "sources": sources, "tool_calls": tool_info})
+                return
+
+            # If unclear, ask again
+            clarify = (
+                "I want to personalize this correctly. Please reply with one option:\n\n"
+                "1. **Docs only**\n"
+                "2. **Both docs + web**\n"
+                "3. **Web only**"
+            )
+            with st.chat_message("assistant", avatar="🤖"):
+                st.markdown(clarify)
+            st.session_state["pending_doc_scope"] = pending_scope
+            save_message(cid, "assistant", clarify)
+            st.session_state["messages"].append({"role": "assistant", "content": clarify, "sources": None, "tool_calls": "Clarification"})
+            return
+
         # ── Handle pending web search confirmation ──
         pending = st.session_state.pop("pending_web_search", None)
         if pending:
@@ -1182,6 +1386,7 @@ def render_chat():
                 with st.chat_message("assistant", avatar="🤖"):
                     with st.spinner("Searching the web..."):
                         answer, sources, tool_info = run_web_agent(pending, user, cid)
+                    answer = humanize_answer(answer, user)
                     st.markdown(clean_answer_urls(answer, sources) if sources else answer)
                     render_sources_and_tools(sources, tool_info)
                 save_message(cid, "assistant", answer, sources=sources, tool_calls=tool_info)
@@ -1190,7 +1395,7 @@ def render_chat():
 
             no_words = {"no", "n", "nope", "nah", "cancel"}
             if prompt.strip().lower() in no_words:
-                reply = "No problem! Ask me anything about your uploaded documents."
+                reply = "No problem. Ask me anything from your uploaded learning materials and I will stay document-grounded."
                 with st.chat_message("assistant", avatar="🤖"):
                     st.markdown(reply)
                 save_message(cid, "assistant", reply)
@@ -1206,7 +1411,7 @@ def render_chat():
                     content = load_url_content(detected_url)
                     if not content.startswith("["):
                         doc_name = store_url_as_doc(detected_url, content)
-                        answer = f"I've loaded **{doc_name}** into memory. You can now ask me questions about this article!"
+                        answer = f"I've loaded **{doc_name}** into your learning workspace. You can now ask role-specific questions from this article."
                     else:
                         answer = f"I couldn't load that URL: {content}"
                 st.markdown(answer)
@@ -1231,6 +1436,16 @@ def render_chat():
                             prompt, image_entries, text_entries, df_entries, user, cid
                         )
 
+                        grounded, reason = validate_doc_grounding(prompt, answer, text_entries, df_entries)
+                        if not grounded:
+                            answer = (
+                                f"{answer}\n\n---\n\n"
+                                f"I could not fully validate this from your uploaded documents ({reason}).\n\n"
+                                f"{get_sample_learning_answer(prompt)}"
+                            )
+                            tool_info = f"{tool_info or 'Document Q&A'}, Validation + Sample Fallback"
+
+                    answer = humanize_answer(answer, user)
                     display_text = clean_answer_urls(answer, sources) if sources else answer
                     st.markdown(display_text)
 
@@ -1249,27 +1464,31 @@ def render_chat():
                 )
 
             else:
-                # Not about docs — ask user if they want web search
-                routing_msg = ("This query doesn't appear to be related to your uploaded documents.\n\n"
-                              "Would you like me to **search the web** for an answer?\n\n"
-                              "Type **Yes** to search the web, or **No** to cancel.")
+                # Not clearly about docs — ask for preferred learning scope first
+                routing_msg = (
+                    "Your question may need broader context. I can still start from your uploaded documents first.\n\n"
+                    "Please choose one option:\n\n"
+                    "1. **Docs only**\n"
+                    "2. **Both docs + web**\n"
+                    "3. **Web only**"
+                )
                 with st.chat_message("assistant", avatar="🤖"):
                     st.markdown(routing_msg)
-                st.session_state["pending_web_search"] = prompt
+                st.session_state["pending_doc_scope"] = prompt
                 save_message(cid, "assistant", routing_msg)
                 st.session_state["messages"].append(
-                    {"role": "assistant", "content": routing_msg, "sources": None, "tool_calls": "Smart Routing"}
+                    {"role": "assistant", "content": routing_msg, "sources": None, "tool_calls": "Learning Scope Routing"}
                 )
 
         else:
-            # No docs uploaded — straight to web agent
+            # No docs uploaded — provide sample learning data first, then offer web search
+            sample_answer = humanize_answer(get_sample_learning_answer(prompt), user)
             with st.chat_message("assistant", avatar="🤖"):
-                with st.spinner("Researching your question..."):
-                    answer, sources, tool_info = run_web_agent(prompt, user, cid)
-                st.markdown(clean_answer_urls(answer, sources) if sources else answer)
-                render_sources_and_tools(sources, tool_info)
-            save_message(cid, "assistant", answer, sources=sources, tool_calls=tool_info)
-            st.session_state["messages"].append({"role": "assistant", "content": answer, "sources": sources, "tool_calls": tool_info})
+                st.markdown(sample_answer)
+                st.markdown("Would you like me to search the web too? Type **Yes** or **No**.")
+            save_message(cid, "assistant", sample_answer, sources=None, tool_calls="Sample Learning Fallback")
+            st.session_state["messages"].append({"role": "assistant", "content": sample_answer, "sources": None, "tool_calls": "Sample Learning Fallback"})
+            st.session_state["pending_web_search"] = prompt
 
 
 # ═══════════════════════════════════════════════
