@@ -975,19 +975,27 @@ def init_agent():
                           azure_endpoint=EP, api_key=AK, temperature=0)
 
     import requests as req
+    from langchain_core.messages import AIMessage, HumanMessage
+    from langchain_community.chat_message_histories import SQLChatMessageHistory
     from langchain_core.tools import tool
     tools_list = []
 
     if TK:
         os.environ["TAVILY_API_KEY"] = TK
-        from langchain_community.tools.tavily_search import TavilySearchResults
-        tavily = TavilySearchResults(max_results=5, search_depth="advanced", include_raw_content=True)
+        from langchain_tavily import TavilySearch
+        tavily = TavilySearch(max_results=5, search_depth="advanced", include_raw_content=True)
 
         @tool
         def search_web_extract_info(query: str) -> str:
             """Search the web for current events, news, or any information."""
             try:
-                results = tavily.invoke(query)
+                try:
+                    results = tavily.invoke({"query": query})
+                except Exception:
+                    results = tavily.invoke(query)
+
+                if isinstance(results, dict):
+                    results = results.get("results") or results.get("items") or [results]
                 if not results: return "No results found."
                 parts = []
                 for i, r in enumerate(results, 1):
@@ -1028,12 +1036,32 @@ ALWAYS use search_web_extract_info for current events, news, sports, elections, 
                              max_iterations=5, verbose=False, return_intermediate_steps=True,
                              handle_parsing_errors=True)
 
-    from langchain_community.chat_message_histories import SQLChatMessageHistory
-    from langchain_core.runnables.history import RunnableWithMessageHistory
-    chatbot = RunnableWithMessageHistory(executor,
-        lambda sid: SQLChatMessageHistory(session_id=sid, connection="sqlite:///agent_memory.db"),
-        input_messages_key="query", history_messages_key="history")
-    return chatbot, None
+    class SQLHistoryAgentRunner:
+        """Drop-in runner that keeps SQL chat memory without deprecated RunnableWithMessageHistory."""
+
+        def __init__(self, wrapped_executor, connection="sqlite:///agent_memory.db"):
+            self.wrapped_executor = wrapped_executor
+            self.connection = connection
+
+        def invoke(self, inputs, config=None):
+            cfg = config or {}
+            session_id = cfg.get("configurable", {}).get("session_id", "default")
+            query_text = (inputs or {}).get("query", "")
+            history_store = SQLChatMessageHistory(session_id=session_id, connection=self.connection)
+
+            result = self.wrapped_executor.invoke({
+                "query": query_text,
+                "history": history_store.messages,
+            })
+
+            answer_text = result.get("output", "") if isinstance(result, dict) else ""
+            history_store.add_messages([
+                HumanMessage(content=query_text),
+                AIMessage(content=answer_text),
+            ])
+            return result
+
+    return SQLHistoryAgentRunner(executor), None
 
 
 # ═══════════════════════════════════════════════
